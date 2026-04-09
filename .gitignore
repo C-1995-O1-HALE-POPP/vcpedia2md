@@ -1,0 +1,10 @@
+.venv
+.vscode
+research
+
+.DS_Store
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
