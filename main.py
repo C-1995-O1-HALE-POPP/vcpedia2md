@@ -657,7 +657,7 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
         fetch_results: dict[str, dict[str, Any] | None] = {}
         fetch_errors: dict[str, str] = {}
         max_workers = max(1, min(per_run, len(batch_urls)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             future_to_url = {executor.submit(mdnew_json, url, logger): url for url in batch_urls}
             for future in concurrent.futures.as_completed(future_to_url):
                 url = future_to_url[future]
