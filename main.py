@@ -129,12 +129,19 @@ def setup_logger(verbose: bool) -> Any:
     level = "DEBUG" if verbose else "INFO"
     # Keep one stdout sink and switch detail level via --verbose.
     logger.remove()
+    format_str = (
+        "<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | {message}"
+        if verbose
+        else "<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}"
+    )
     logger.add(
         sys.stdout,
         level=level,
         colorize=True,
         backtrace=verbose,
         diagnose=verbose,
+        format=format_str,
     )
     return logger
 
@@ -145,11 +152,17 @@ def mdnew_json(url: str, logger: Any, retries: int = 3) -> dict:
     last_err: Exception | None = None
     for i in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=45) as r:
-                return json.loads(r.read().decode("utf-8", errors="ignore"))
+            logger.debug(f"mdnew request start | attempt={i}/{retries} | url={url} | endpoint={endpoint}")
+            with urllib.request.urlopen(req, timeout=180) as r:
+                payload = json.loads(r.read().decode("utf-8", errors="ignore"))
+                logger.debug(
+                    f"mdnew request ok | attempt={i}/{retries} | url={url} | "
+                    f"success={payload.get('success')} | keys={sorted(payload.keys())}"
+                )
+                return payload
         except Exception as e:
             last_err = e
-            logger.debug(f"request failed (attempt {i}/{retries}): {e}")
+            logger.debug(f"mdnew request failed | attempt={i}/{retries} | url={url} | err={e}")
             time.sleep(0.5 * i)
     if last_err:
         raise last_err
@@ -269,6 +282,10 @@ def generate_summary_with_llm(
     source_text = compact_excerpt(content, max_len=max(500, source_max_chars))
 
     # Throttle outbound LLM calls to reduce 429 and protect upstream capacity.
+    logger.debug(
+        f"llm summary start | model={model} | title={title} | source_chars={len(source_text)} "
+        f"| max_tokens={max_tokens} | qps_limit={limiter._qps}"
+    )
     limiter.wait()
     response = client.chat.completions.create(
         model=model,
@@ -297,6 +314,7 @@ def generate_summary_with_llm(
     message = choice.message if choice else None
     text = message.content if message else None
     if not isinstance(text, str) or not text.strip():
+        logger.debug(f"llm summary invalid response | title={title} | response_has_choices={bool(response.choices)}")
         raise RuntimeError("invalid llm response: empty message content")
 
     usage = getattr(response, "usage", None)
@@ -304,7 +322,13 @@ def generate_summary_with_llm(
     completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
     total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
 
-    return re.sub(r"\s+", " ", text).strip(), LlmUsage(
+    summary_text = re.sub(r"\s+", " ", text).strip()
+    logger.debug(
+        f"llm summary ok | title={title} | summary_chars={len(summary_text)} | "
+        f"prompt_tokens={prompt_tokens} | completion_tokens={completion_tokens} | total_tokens={total_tokens}"
+    )
+
+    return summary_text, LlmUsage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
@@ -521,6 +545,7 @@ def load_explore_filter_rules(
        }
     """
     if not filter_path.exists():
+        logger.debug(f"explore filter missing | file={filter_path}")
         return set(), set(), {}
 
     raw = json.loads(filter_path.read_text(encoding="utf-8"))
@@ -564,6 +589,11 @@ def load_explore_filter_rules(
         f"explore filter loaded | file={filter_path} | stop_expand_pages={len(stop_expand_pages)} "
         f"| all_blocked={len(all_blocked_pages)} | global_block_links={len(global_block_links)} "
         f"| block_links_by_source={len(block_links_by_source)}"
+    )
+    logger.debug(
+        f"explore filter detail | stop_expand_pages={sorted(stop_expand_pages)} | "
+        f"global_block_links={sorted(global_block_links)} | "
+        f"block_links_by_source={{{', '.join(f'{k}: {sorted(v)}' for k, v in block_links_by_source.items())}}}"
     )
     return stop_expand_pages, global_block_links, block_links_by_source
 
@@ -615,6 +645,10 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
         f"crawl start | queue={len(queue)} | visited={len(visited)} | failed={len(failed)} "
         f"| per_run={per_run} | target_total={target_total if target_total is not None else 'none'}"
     )
+    logger.debug(
+        f"crawl state loaded | queue_head={queue[:5]} | visited_sample={sorted(list(visited))[:5]} | "
+        f"failed_sample={sorted(list(failed))[:5]} | state_file={state_path}"
+    )
 
     while queue and fetched_this_run < per_run:
         if target_total is not None and len(visited) >= target_total:
@@ -629,6 +663,10 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
         # Step 1: pick URLs for this batch, skipping entries still in backoff.
         batch_urls: list[str] = []
         inspect_budget = len(queue)
+        logger.debug(
+            f"batch selection start | queue_size={len(queue)} | inspect_budget={inspect_budget} "
+            f"| fetched_this_run={fetched_this_run} | remaining_quota={remaining_quota}"
+        )
         for _ in range(inspect_budget):
             if len(batch_urls) >= remaining_quota:
                 break
@@ -644,28 +682,36 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
                 queue.append(url)
                 queued.add(url)
                 deferred_retry_this_run += 1
+                logger.debug(
+                    f"batch selection deferred | url={url} | next_retry_at={next_retry_at.isoformat()}"
+                )
                 continue
 
             batch_urls.append(url)
+            logger.debug(f"batch selection picked | url={url}")
 
         if not batch_urls:
             logger.info("all pending URLs are in backoff window, stop this run")
             break
 
         scanned_this_run += len(batch_urls)
+        logger.debug(f"batch ready | batch_size={len(batch_urls)} | batch_urls={batch_urls}")
         # Step 2: fetch markdown.new payloads in parallel (network-bound work).
         fetch_results: dict[str, dict[str, Any] | None] = {}
         fetch_errors: dict[str, str] = {}
         max_workers = max(1, min(per_run, len(batch_urls)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        logger.debug(f"batch fetch start | max_workers={max_workers} | batch_size={len(batch_urls)}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_url = {executor.submit(mdnew_json, url, logger): url for url in batch_urls}
             for future in concurrent.futures.as_completed(future_to_url):
                 url = future_to_url[future]
                 try:
                     fetch_results[url] = future.result()
+                    logger.debug(f"batch fetch ok | url={url}")
                 except Exception as e:
                     fetch_results[url] = None
                     fetch_errors[url] = str(e)
+                    logger.debug(f"batch fetch error | url={url} | err={e}")
 
         # Step 3: apply crawl side effects sequentially to keep state/index writes predictable.
         for url in batch_urls:
@@ -685,6 +731,7 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
                 continue
 
             if not data.get("success"):
+                logger.debug(f"api returned success=false | url={url} | keys={sorted(data.keys())}")
                 prev_count = int((failure_meta.get(url) or {}).get("count", 0) or 0)
                 count = prev_count + 1
                 failure_meta[url] = {
@@ -698,6 +745,10 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
 
             title = (data.get("title") or "").strip() or page_slug_from_url(url)
             content = data.get("content") or ""
+            logger.debug(
+                f"page payload ready | url={url} | title={title} | content_chars={len(content)} | "
+                f"content_preview={compact_excerpt(content, max_len=200)}"
+            )
             try:
                 summary, usage = generate_summary_with_llm(
                     title=title,
@@ -717,8 +768,13 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
                 logger.warning(f"llm summary failed | url={url} | err={e} | fallback=short_summary")
                 summary = short_summary(content)
                 llm_fallback_count += 1
+                logger.debug(f"llm fallback summary | url={url} | summary={summary}")
             out_path = write_page_markdown(pages_dir, title, url, summary, content)
             fetched_at = iso_now()
+            logger.debug(
+                f"page persist start | url={url} | out_path={out_path} | fetched_at={fetched_at} | "
+                f"summary_chars={len(summary)}"
+            )
             upsert_index_record(
                 index_file,
                 {
@@ -736,18 +792,35 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
             fetched_this_run += 1
 
             extracted_links = extract_internal_links(content)
+            logger.debug(
+                f"link extraction done | url={url} | extracted_count={len(extracted_links)} | "
+                f"sample={extracted_links[:10]}"
+            )
             if url in stop_expand_pages:
                 enqueue_skipped_by_filter += len(extracted_links)
+                logger.debug(
+                    f"expansion blocked by stop_expand_pages/all_blocked | source={url} | "
+                    f"blocked_count={len(extracted_links)}"
+                )
             else:
                 source_block_set = block_links_by_source.get(url, set())
                 for link in extracted_links:
                     if link in global_block_links or link in source_block_set:
                         enqueue_skipped_by_filter += 1
+                        logger.debug(
+                            f"link filtered out | source={url} | target={link} | "
+                            f"reason={'global_block_links' if link in global_block_links else 'block_links_by_source'}"
+                        )
                         continue
                     if link in visited or link in queued:
+                        logger.debug(
+                            f"link skipped as duplicate | source={url} | target={link} | "
+                            f"visited={link in visited} | queued={link in queued}"
+                        )
                         continue
                     queue.append(link)
                     queued.add(link)
+                    logger.debug(f"link enqueued | source={url} | target={link} | new_queue_size={len(queue)}")
 
             logger.info(f"saved page | visited={len(visited)} | path={out_path.name} | url={url}")
 
@@ -762,6 +835,10 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
     state["failed"] = sorted(failed)
     state["failure_meta"] = failure_meta
     save_crawl_state(state_path, state)
+    logger.debug(
+        f"state saved | queue_size={len(queue)} | visited_size={len(visited)} | failed_size={len(failed)} | "
+        f"state_file={state_path}"
+    )
 
     logger.info(
         f"crawl done | fetched_this_run={fetched_this_run} | scanned_this_run={scanned_this_run} "
@@ -775,6 +852,11 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
         f"| llm_fallback={llm_fallback_count} | enqueue_filtered={enqueue_skipped_by_filter} "
         f"| prompt_tokens={llm_usage.prompt_tokens} "
         f"| completion_tokens={llm_usage.completion_tokens} | total_tokens={llm_usage.total_tokens}"
+    )
+    logger.debug(
+        f"crawl summary detail | scanned={scanned_this_run} | fetched={fetched_this_run} | "
+        f"failed={failed_this_run} | deferred={deferred_retry_this_run} | "
+        f"visited_total={len(visited)} | queue_remaining={len(queue)} | failed_total={len(failed)}"
     )
 
     return CrawlRunStats(
@@ -795,6 +877,11 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
 def main() -> None:
     args = parse_args()
     logger = setup_logger(args.verbose)
+    logger.debug(
+        f"runtime config | start_url={args.start_url} | per_run={args.per_run} | target_total={args.target_total} | "
+        f"llm_model={args.llm_model} | llm_qps={args.llm_qps} | verbose={args.verbose} | "
+        f"filter_json={args.explore_filter_json}"
+    )
     stats = CrawlRunStats()
     title = "VCPedia Crawl 完成"
     try:
