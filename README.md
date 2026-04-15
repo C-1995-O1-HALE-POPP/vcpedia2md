@@ -126,6 +126,26 @@ LLM 接口：
     --explore-filter-json "research/vcpedia-explore-filter.json" \
     --notify-on-failure
 
+如果要在爬虫结束后自动把生成的页面上传到知识库，再补上知识库参数：
+
+  export ASTRBOT_BASE_URL="http://127.0.0.1:6185"
+  export ASTRBOT_KB_ID="你的知识库ID"
+  export ASTRBOT_TOKEN="你的JWT token"
+
+  python main.py \
+    --start-url "https://vcpedia.cn/zh-hans/Template:%E6%B4%9B%E5%A4%A9%E4%BE%9D" \
+    --per-run 20 \
+    --llm-qps 1.0 \
+    --explore-filter-json "research/vcpedia-explore-filter.json" \
+    --kb-id "$ASTRBOT_KB_ID" \
+    --kb-base-url "$ASTRBOT_BASE_URL" \
+    --kb-token "$ASTRBOT_TOKEN" \
+    --kb-progress-file "research/vcpedia-kb-upload-state.json" \
+    --notify-on-failure
+
+默认会上传 [research/vcpedia-pages-md](research/vcpedia-pages-md) 下生成的 Markdown 文件。
+上传进度会记录在 [research/vcpedia-kb-upload-state.json](research/vcpedia-kb-upload-state.json)；如果某些文档上次未成功上传，下次运行会自动补传。
+
 ## 7. 产物位置
 
 - 页面 Markdown： [research/vcpedia-pages-md](research/vcpedia-pages-md)

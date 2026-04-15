@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from kb_batch_upload import UploadError, build_upload_summary, upload_files_to_kb
 from loguru import logger  # pyright: ignore[reportMissingImports]
 from openai import OpenAI  # pyright: ignore[reportMissingImports]
 
@@ -105,6 +106,37 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--llm-timeout", type=int, default=60, help="LLM request timeout seconds")
     p.add_argument("--summary-context-chars", type=int, default=6000, help="Max source chars sent to LLM summary")
     p.add_argument("--summary-max-tokens", type=int, default=180, help="LLM max_tokens for summary generation")
+    p.add_argument(
+        "--kb-id",
+        default=os.getenv("ASTRBOT_KB_ID", ""),
+        help="AstrBot knowledge base ID; set to auto-upload generated pages after crawl",
+    )
+    p.add_argument(
+        "--kb-base-url",
+        default=os.getenv("ASTRBOT_BASE_URL", "http://127.0.0.1:6185"),
+        help="AstrBot dashboard base URL for knowledge base upload",
+    )
+    p.add_argument("--kb-token", default=os.getenv("ASTRBOT_TOKEN", ""), help="JWT token for KB upload")
+    p.add_argument("--kb-username", default=os.getenv("ASTRBOT_USERNAME", ""), help="Dashboard username")
+    p.add_argument("--kb-password", default=os.getenv("ASTRBOT_PASSWORD", ""), help="Dashboard password")
+    p.add_argument(
+        "--kb-files-per-task",
+        type=int,
+        default=20,
+        help="How many files to include in one KB upload task",
+    )
+    p.add_argument("--kb-poll-interval", type=float, default=1.5, help="Seconds between KB upload progress polling")
+    p.add_argument("--kb-chunk-size", type=int, default=512, help="KB upload chunk size")
+    p.add_argument("--kb-chunk-overlap", type=int, default=50, help="KB upload chunk overlap")
+    p.add_argument("--kb-batch-size", type=int, default=32, help="KB upload embedding batch size")
+    p.add_argument("--kb-tasks-limit", type=int, default=3, help="KB upload embedding concurrency")
+    p.add_argument("--kb-max-retries", type=int, default=3, help="KB upload max retries")
+    p.add_argument("--kb-timeout", type=float, default=120.0, help="KB upload HTTP request timeout")
+    p.add_argument(
+        "--kb-progress-file",
+        default=str(BASE / "research/vcpedia-kb-upload-state.json"),
+        help="Persistent KB upload progress json file",
+    )
     p.add_argument(
         "--serverchan3-sendkey",
         default=os.getenv("SERVERCHAN3_SENDKEY", ""),
@@ -357,6 +389,10 @@ def build_run_summary_message(args: argparse.Namespace, stats: CrawlRunStats, st
         lines.append(f"错误: {error}")
     lines.append(f"时间: {iso_now()}")
     return "\n".join(lines)
+
+
+def build_kb_upload_message(result: dict[str, Any]) -> str:
+    return build_upload_summary(result)
 
 
 def send_serverchan3_notification(
@@ -883,13 +919,43 @@ def main() -> None:
         f"filter_json={args.explore_filter_json}"
     )
     stats = CrawlRunStats()
+    upload_result: dict[str, Any] | None = None
     title = "VCPedia Crawl 完成"
     try:
         stats = run_incremental_crawl_mode(args, logger)
         desp = build_run_summary_message(args, stats, status="成功")
+
+        if args.kb_id.strip():
+            upload_result = upload_files_to_kb(
+                base_url=args.kb_base_url.rstrip("/"),
+                kb_id=args.kb_id.strip(),
+                paths=[args.pages_dir],
+                recursive=False,
+                ext=[".md"],
+                token=args.kb_token,
+                username=args.kb_username,
+                password=args.kb_password,
+                progress_file=args.kb_progress_file,
+                files_per_task=args.kb_files_per_task,
+                poll_interval=args.kb_poll_interval,
+                chunk_size=args.kb_chunk_size,
+                chunk_overlap=args.kb_chunk_overlap,
+                batch_size=args.kb_batch_size,
+                tasks_limit=args.kb_tasks_limit,
+                max_retries=args.kb_max_retries,
+                timeout=args.kb_timeout,
+            )
+            desp = desp + "\n\n" + build_kb_upload_message(upload_result)
+            if int(upload_result.get("total_failed", 0) or 0) > 0:
+                title = "VCPedia Crawl + KB Upload 失败"
+                raise UploadError(
+                    f"Knowledge base upload finished with {upload_result['total_failed']} failed file(s)"
+                )
     except Exception as e:
-        title = "VCPedia Crawl 失败"
+        title = "VCPedia Crawl 失败" if upload_result is None else "VCPedia Crawl + KB Upload 失败"
         desp = build_run_summary_message(args, stats, status="失败", error=str(e))
+        if upload_result is not None:
+            desp = desp + "\n\n" + build_kb_upload_message(upload_result)
         if args.notify_on_failure:
             try:
                 send_serverchan3_notification(
