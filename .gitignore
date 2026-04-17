@@ -11,4 +11,8 @@ __pycache__
 
 research/vcpedia-crawl-state.json
 research/vcpedia-pages-index.jsonl
+research/vcpedia-summary-cache.json
 research/vcpedia-pages-md
+
+.env
+.codex

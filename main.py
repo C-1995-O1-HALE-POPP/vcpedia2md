@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Incrementally crawl VCPedia via markdown.new and persist page markdown artifacts."""
+"""Incrementally crawl VCPedia via MarkItDown and persist page markdown artifacts."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from typing import Any
 
 from kb_batch_upload import UploadError, build_upload_summary, upload_files_to_kb
 from loguru import logger  # pyright: ignore[reportMissingImports]
+from markitdown import MarkItDown  # pyright: ignore[reportMissingImports]
 from openai import OpenAI  # pyright: ignore[reportMissingImports]
 
 BASE = Path(__file__).resolve().parent
@@ -28,9 +29,10 @@ PAGES_DIR = BASE / "research/vcpedia-pages-md"
 STATE_FILE = BASE / "research/vcpedia-crawl-state.json"
 INDEX_FILE = BASE / "research/vcpedia-pages-index.jsonl"
 EXPLORE_FILTER_FILE = BASE / "research/vcpedia-explore-filter.json"
-
-API = "https://markdown.new"
-DEFAULT_START_URL = "https://vcpedia.cn/zh-hans/Template:%E6%B4%9B%E5%A4%A9%E4%BE%9D"
+SUMMARY_CACHE_FILE = BASE / "research/vcpedia-summary-cache.json"
+SUMMARY_SOURCE_MAX_CHARS = 65536
+SUMMARY_MAX_TOKENS = 512
+SUMMARY_MIN_CHARS_FOR_LLM = 1024
 
 
 BAD_PATH_HINTS = (
@@ -54,8 +56,7 @@ BAD_URL_HINTS = (
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fetch VCPedia pages via markdown.new")
-    p.add_argument("--start-url", default=DEFAULT_START_URL, help="Seed VCPedia URL")
+    p = argparse.ArgumentParser(description="Fetch VCPedia pages via MarkItDown")
     p.add_argument("--pages-dir", default=str(PAGES_DIR), help="Directory to store per-page markdown files")
     p.add_argument("--state-file", default=str(STATE_FILE), help="Crawler state json path")
     p.add_argument("--index-file", default=str(INDEX_FILE), help="Index manifest jsonl path for RAG")
@@ -63,16 +64,21 @@ def parse_args() -> argparse.Namespace:
         "--explore-filter-json",
         default=str(EXPLORE_FILTER_FILE),
         help=(
-            "Manual JSON rules for enqueue filtering. Supported: "
-            "list[url] (source pages that stop expansion) or "
-            "{stop_expand_pages, block_links, block_links_by_source}."
+            "Manual JSON rules for URL deny filtering. Supported: "
+            "list[regex] or {deny_patterns:[regex]}."
         ),
     )
     p.add_argument(
         "--per-run",
         type=int,
         default=20,
-        help="Max pages fetched per run and max parallel workers in crawl mode",
+        help="Max pages fetched per run",
+    )
+    p.add_argument(
+        "--fetch-workers",
+        type=int,
+        default=64,
+        help="Max parallel workers for page fetch in crawl mode",
     )
     p.add_argument(
         "--target-total",
@@ -94,18 +100,16 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--llm-model",
-        default=os.getenv("OPENAI_MODEL", "gpt-5-nano"),
+        default=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
         help="Model name for OpenAI-compatible chat/completions",
     )
     p.add_argument(
         "--llm-qps",
         type=float,
-        default=1.0,
+        default=3.0,
         help="AI service rate limit in requests per second (<=0 disables throttling)",
     )
     p.add_argument("--llm-timeout", type=int, default=60, help="LLM request timeout seconds")
-    p.add_argument("--summary-context-chars", type=int, default=6000, help="Max source chars sent to LLM summary")
-    p.add_argument("--summary-max-tokens", type=int, default=180, help="LLM max_tokens for summary generation")
     p.add_argument(
         "--kb-id",
         default=os.getenv("ASTRBOT_KB_ID", ""),
@@ -178,23 +182,44 @@ def setup_logger(verbose: bool) -> Any:
     return logger
 
 
-def mdnew_json(url: str, logger: Any, retries: int = 3) -> dict:
-    endpoint = f"{API}/{url}?format=json"
-    req = urllib.request.Request(endpoint, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+def extract_title_from_markdown(markdown_text: str, fallback_url: str) -> str:
+    for line in markdown_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            title = stripped.lstrip("#").strip()
+            if title:
+                return title
+    return page_slug_from_url(fallback_url)
+
+
+def markitdown_convert_url(url: str, logger: Any, retries: int = 3) -> dict:
     last_err: Exception | None = None
     for i in range(1, retries + 1):
         try:
-            logger.debug(f"mdnew request start | attempt={i}/{retries} | url={url} | endpoint={endpoint}")
-            with urllib.request.urlopen(req, timeout=180) as r:
-                payload = json.loads(r.read().decode("utf-8", errors="ignore"))
-                logger.debug(
-                    f"mdnew request ok | attempt={i}/{retries} | url={url} | "
-                    f"success={payload.get('success')} | keys={sorted(payload.keys())}"
-                )
-                return payload
+            logger.debug(f"markitdown convert start | attempt={i}/{retries} | url={url}")
+            converter = MarkItDown(enable_plugins=True)
+            result = converter.convert(url)
+            markdown_text = getattr(result, "text_content", "") or ""
+            title = (
+                getattr(result, "title", "")
+                or getattr(getattr(result, "metadata", None), "title", "")
+                or extract_title_from_markdown(markdown_text, url)
+            )
+            payload = {
+                "success": bool(markdown_text.strip()),
+                "title": title.strip() or page_slug_from_url(url),
+                "content": markdown_text,
+            }
+            logger.debug(
+                f"markitdown convert ok | attempt={i}/{retries} | url={url} | "
+                f"success={payload['success']} | content_chars={len(markdown_text)}"
+            )
+            return payload
         except Exception as e:
             last_err = e
-            logger.debug(f"mdnew request failed | attempt={i}/{retries} | url={url} | err={e}")
+            logger.debug(f"markitdown convert failed | attempt={i}/{retries} | url={url} | err={e}")
             time.sleep(0.5 * i)
     if last_err:
         raise last_err
@@ -296,8 +321,84 @@ class CrawlRunStats:
     failed_total: int = 0
     llm_success_count: int = 0
     llm_fallback_count: int = 0
+    llm_cache_hit_count: int = 0
     enqueue_skipped_by_filter: int = 0
     llm_usage: LlmUsage = field(default_factory=LlmUsage)
+
+
+def content_summary_cache_key(title: str, content: str) -> str:
+    h = hashlib.sha1()
+    h.update(title.strip().encode("utf-8"))
+    h.update(b"\n")
+    h.update(content.strip().encode("utf-8"))
+    return h.hexdigest()
+
+
+def load_summary_cache(cache_path: Path, logger: Any) -> dict[str, str]:
+    if not cache_path.exists():
+        logger.debug(f"summary cache missing | file={cache_path}")
+        return {}
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"summary cache load failed | file={cache_path} | err={e}")
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning(f"summary cache invalid schema | file={cache_path}")
+        return {}
+    cache = {
+        str(k): str(v).strip()
+        for k, v in raw.items()
+        if isinstance(k, str) and isinstance(v, str) and v.strip()
+    }
+    logger.info(f"summary cache loaded | file={cache_path} | entries={len(cache)}")
+    return cache
+
+
+def save_summary_cache(cache_path: Path, cache: dict[str, str], logger: Any) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(cache_path)
+    logger.debug(f"summary cache saved | file={cache_path} | entries={len(cache)}")
+
+
+def build_summary(
+    *,
+    title: str,
+    content: str,
+    logger: Any,
+    llm_client: OpenAI | None,
+    llm_rate_limiter: RequestRateLimiter,
+    llm_model: str,
+    summary_cache: dict[str, str],
+) -> tuple[str, LlmUsage, str]:
+    summary_cache_key = content_summary_cache_key(title, content)
+    cached_summary = summary_cache.get(summary_cache_key, "")
+    if cached_summary:
+        logger.debug(f"summary cache hit | title={title} | cache_key={summary_cache_key}")
+        return cached_summary, LlmUsage(), "cache_hit"
+
+    excerpt = compact_excerpt(content, max_len=SUMMARY_SOURCE_MAX_CHARS)
+    if llm_client is None or len(excerpt) < SUMMARY_MIN_CHARS_FOR_LLM:
+        summary = short_summary(content)
+        logger.debug(
+            f"summary local shortcut | title={title} | llm_enabled={llm_client is not None} | summary={summary}"
+        )
+        return summary, LlmUsage(), "fallback"
+
+    summary, usage = generate_summary_with_llm(
+        title=title,
+        content=content,
+        logger=logger,
+        client=llm_client,
+        limiter=llm_rate_limiter,
+        model=llm_model,
+        source_max_chars=SUMMARY_SOURCE_MAX_CHARS,
+        max_tokens=SUMMARY_MAX_TOKENS,
+    )
+    summary_cache[summary_cache_key] = summary
+    return summary, usage, "llm"
 
 
 def generate_summary_with_llm(
@@ -321,25 +422,25 @@ def generate_summary_with_llm(
     limiter.wait()
     response = client.chat.completions.create(
         model=model,
-        temperature=0.2,
-        max_tokens=max(16, int(max_tokens)),
         messages=[
             {
                 "role": "system",
-                "content": "You summarize wiki-like pages into concise Chinese text for JSON fields.",
+                "content": "你负责把 wiki 页面压缩成简洁中文摘要。",
             },
             {
                 "role": "user",
                 "content": (
                     "请基于页面内容生成中文摘要，要求：\n"
-                    "1) 80-140字；\n"
+                    "1) 60-100字；\n"
                     "2) 客观、中性；\n"
                     "3) 不输出项目符号；\n"
-                    "4) 不包含\"本文\"\"该页面\"等指代。\n\n"
+                    "4) 不包含\"本文\"\"该页面\"等指代；\n"
+                    "5) 优先概括人物/作品/事件/组织的身份与关键特征。\n\n"
                     f"标题：{title}\n\n内容：\n{source_text}"
                 ),
             },
         ],
+        max_tokens=max_tokens,
     )
 
     choice = response.choices[0] if response.choices else None
@@ -380,6 +481,7 @@ def build_run_summary_message(args: argparse.Namespace, stats: CrawlRunStats, st
         f"队列剩余: {stats.queue_size}",
         f"LLM成功: {stats.llm_success_count}",
         f"LLM回退: {stats.llm_fallback_count}",
+        f"LLM缓存命中: {stats.llm_cache_hit_count}",
         f"入队过滤: {stats.enqueue_skipped_by_filter}",
         f"LLM prompt_tokens: {stats.llm_usage.prompt_tokens}",
         f"LLM completion_tokens: {stats.llm_usage.completion_tokens}",
@@ -440,7 +542,7 @@ def build_page_filename(title: str, url: str) -> str:
     return f"{base_name}-{suffix}.md"
 
 
-def load_crawl_state(state_path: Path, start_url: str) -> dict:
+def load_crawl_state(state_path: Path) -> dict:
     if state_path.exists():
         raw = json.loads(state_path.read_text(encoding="utf-8"))
         queue = [clean_url(u) for u in raw.get("queue", []) if isinstance(u, str) and u.strip()]
@@ -459,7 +561,6 @@ def load_crawl_state(state_path: Path, start_url: str) -> dict:
                     "last_error": str(v.get("last_error") or ""),
                 }
         return {
-            "start_url": raw.get("start_url") or clean_url(start_url),
             "queue": queue,
             "visited": visited,
             "failed": failed,
@@ -468,10 +569,8 @@ def load_crawl_state(state_path: Path, start_url: str) -> dict:
             "updated_at": raw.get("updated_at") or iso_now(),
         }
 
-    seed = clean_url(start_url)
     return {
-        "start_url": seed,
-        "queue": [seed],
+        "queue": [],
         "visited": [],
         "failed": [],
         "failure_meta": {},
@@ -567,97 +666,96 @@ def compute_next_retry_at(count: int, base_seconds: float, max_seconds: float) -
 def load_explore_filter_rules(
     filter_path: Path,
     logger: Any,
-) -> tuple[set[str], set[str], dict[str, set[str]]]:
-    """Load manual enqueue filtering rules from JSON.
+) -> list[re.Pattern[str]]:
+    """Load regex-based deny rules from JSON.
 
     Supported schema:
-    1) ["https://vcpedia.cn/..."]
-       -> source pages that stop expansion entirely.
-    2) {
-         "stop_expand_pages": [...],
-            "all_blocked": [...],
-         "block_links": [...],
-         "block_links_by_source": {"<source_url>": ["<target_url>"]}
-       }
+    1) ["regex1", "regex2"]
+    2) {"deny_patterns": ["regex1", "regex2"]}
+
+    Backward compatibility:
+    - older exact-url fields are converted into escaped regex patterns.
     """
     if not filter_path.exists():
         logger.debug(f"explore filter missing | file={filter_path}")
-        return set(), set(), {}
+        return []
 
     raw = json.loads(filter_path.read_text(encoding="utf-8"))
-    stop_expand_pages: set[str] = set()
-    all_blocked_pages: set[str] = set()
-    global_block_links: set[str] = set()
-    block_links_by_source: dict[str, set[str]] = {}
+    raw_patterns: list[str] = []
 
     if isinstance(raw, list):
         for item in raw:
             if isinstance(item, str) and item.strip():
-                stop_expand_pages.add(clean_url(item))
+                raw_patterns.append(item.strip())
     elif isinstance(raw, dict):
-        for item in raw.get("stop_expand_pages", []):
+        for item in raw.get("deny_patterns", []):
             if isinstance(item, str) and item.strip():
-                stop_expand_pages.add(clean_url(item))
-        for item in raw.get("all_blocked", []):
-            if isinstance(item, str) and item.strip():
-                all_blocked_pages.add(clean_url(item))
-        for item in raw.get("block_links", []):
-            if isinstance(item, str) and item.strip():
-                global_block_links.add(clean_url(item))
+                raw_patterns.append(item.strip())
+        for legacy_key in ("stop_expand_pages", "all_blocked", "block_links"):
+            for item in raw.get(legacy_key, []):
+                if isinstance(item, str) and item.strip():
+                    raw_patterns.append(re.escape(clean_url(item)))
         by_source = raw.get("block_links_by_source", {})
         if isinstance(by_source, dict):
             for source, targets in by_source.items():
-                if not isinstance(source, str) or not source.strip() or not isinstance(targets, list):
-                    continue
-                normalized_source = clean_url(source)
-                normalized_targets: set[str] = set()
-                for target in targets:
-                    if isinstance(target, str) and target.strip():
-                        normalized_targets.add(clean_url(target))
-                if normalized_targets:
-                    block_links_by_source[normalized_source] = normalized_targets
+                if isinstance(source, str) and source.strip():
+                    raw_patterns.append(re.escape(clean_url(source)))
+                if isinstance(targets, list):
+                    for target in targets:
+                        if isinstance(target, str) and target.strip():
+                            raw_patterns.append(re.escape(clean_url(target)))
     else:
         raise ValueError(f"unsupported explore-filter-json schema: {filter_path}")
 
-    stop_expand_pages.update(all_blocked_pages)
+    patterns: list[re.Pattern[str]] = []
+    invalid_patterns: list[str] = []
+    for pattern in raw_patterns:
+        try:
+            patterns.append(re.compile(pattern))
+        except re.error:
+            invalid_patterns.append(pattern)
 
     logger.info(
-        f"explore filter loaded | file={filter_path} | stop_expand_pages={len(stop_expand_pages)} "
-        f"| all_blocked={len(all_blocked_pages)} | global_block_links={len(global_block_links)} "
-        f"| block_links_by_source={len(block_links_by_source)}"
+        f"explore filter loaded | file={filter_path} | deny_patterns={len(patterns)} "
+        f"| invalid_patterns={len(invalid_patterns)}"
     )
-    logger.debug(
-        f"explore filter detail | stop_expand_pages={sorted(stop_expand_pages)} | "
-        f"global_block_links={sorted(global_block_links)} | "
-        f"block_links_by_source={{{', '.join(f'{k}: {sorted(v)}' for k, v in block_links_by_source.items())}}}"
-    )
-    return stop_expand_pages, global_block_links, block_links_by_source
+    if invalid_patterns:
+        logger.warning(f"explore filter has invalid regex patterns | patterns={invalid_patterns}")
+    logger.debug(f"explore filter detail | patterns={[p.pattern for p in patterns]}")
+    return patterns
+
+
+def match_deny_pattern(url: str, patterns: list[re.Pattern[str]]) -> str | None:
+    for pattern in patterns:
+        if pattern.search(url):
+            return pattern.pattern
+    return None
 
 
 def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRunStats:
     pages_dir = Path(args.pages_dir)
     state_path = Path(args.state_file)
     index_file = Path(args.index_file)
-    state = load_crawl_state(state_path, args.start_url)
+    state = load_crawl_state(state_path)
 
     queue = list(state["queue"])
     queued = set(queue)
     visited = set(state["visited"])
     failed = set(state["failed"])
     failure_meta: dict[str, dict[str, Any]] = dict(state.get("failure_meta", {}))
-    stop_expand_pages, global_block_links, block_links_by_source = load_explore_filter_rules(
-        Path(args.explore_filter_json),
-        logger,
-    )
+    deny_patterns = load_explore_filter_rules(Path(args.explore_filter_json), logger)
+    summary_cache_path = SUMMARY_CACHE_FILE
+    summary_cache = load_summary_cache(summary_cache_path, logger)
 
-    if not args.llm_api_key.strip():
-        raise RuntimeError("missing --llm-api-key (or OPENAI_API_KEY)")
-
-    llm_client = OpenAI(
-        api_key=args.llm_api_key,
-        base_url=args.llm_base_url.rstrip("/"),
-        timeout=max(1, int(args.llm_timeout)),
-    )
+    llm_client: OpenAI | None = None
+    if args.llm_api_key.strip():
+        llm_client = OpenAI(
+            api_key=args.llm_api_key,
+            base_url=args.llm_base_url.rstrip("/"),
+            timeout=max(1, int(args.llm_timeout)),
+        )
+    else:
+        logger.info("llm summary disabled: missing api key, will use local short_summary")
     llm_rate_limiter = RequestRateLimiter(args.llm_qps)
 
     target_total = args.target_total if args.target_total > 0 else None
@@ -674,6 +772,7 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
     deferred_retry_this_run = 0
     llm_success_count = 0
     llm_fallback_count = 0
+    llm_cache_hit_count = 0
     enqueue_skipped_by_filter = 0
     llm_usage = LlmUsage()
 
@@ -681,6 +780,8 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
         f"crawl start | queue={len(queue)} | visited={len(visited)} | failed={len(failed)} "
         f"| per_run={per_run} | target_total={target_total if target_total is not None else 'none'}"
     )
+    if not queue:
+        logger.warning(f"没有待抓取 URL，请手动编辑 {state_path} 的 state.queue")
     logger.debug(
         f"crawl state loaded | queue_head={queue[:5]} | visited_sample={sorted(list(visited))[:5]} | "
         f"failed_sample={sorted(list(failed))[:5]} | state_file={state_path}"
@@ -698,6 +799,7 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
 
         # Step 1: pick URLs for this batch, skipping entries still in backoff.
         batch_urls: list[str] = []
+        batch_selected: set[str] = set()
         inspect_budget = len(queue)
         logger.debug(
             f"batch selection start | queue_size={len(queue)} | inspect_budget={inspect_budget} "
@@ -709,7 +811,17 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
             url = queue.pop(0)
             queued.discard(url)
 
+            if url in batch_selected:
+                logger.debug(f"batch selection skip duplicate in same batch | url={url}")
+                continue
+
             if url in visited:
+                continue
+
+            denied_by = match_deny_pattern(url, deny_patterns)
+            if denied_by:
+                enqueue_skipped_by_filter += 1
+                logger.debug(f"url denied before fetch | url={url} | pattern={denied_by}")
                 continue
 
             meta = failure_meta.get(url) or {}
@@ -724,6 +836,7 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
                 continue
 
             batch_urls.append(url)
+            batch_selected.add(url)
             logger.debug(f"batch selection picked | url={url}")
 
         if not batch_urls:
@@ -732,13 +845,15 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
 
         scanned_this_run += len(batch_urls)
         logger.debug(f"batch ready | batch_size={len(batch_urls)} | batch_urls={batch_urls}")
-        # Step 2: fetch markdown.new payloads in parallel (network-bound work).
+        # Step 2: fetch page markdown in parallel (network-bound work).
         fetch_results: dict[str, dict[str, Any] | None] = {}
         fetch_errors: dict[str, str] = {}
-        max_workers = max(1, min(per_run, len(batch_urls)))
+        max_workers = max(1, min(max(1, args.fetch_workers), len(batch_urls)))
         logger.debug(f"batch fetch start | max_workers={max_workers} | batch_size={len(batch_urls)}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_url = {executor.submit(mdnew_json, url, logger): url for url in batch_urls}
+            future_to_url = {
+                executor.submit(markitdown_convert_url, url, logger): url for url in batch_urls
+            }
             for future in concurrent.futures.as_completed(future_to_url):
                 url = future_to_url[future]
                 try:
@@ -767,7 +882,7 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
                 continue
 
             if not data.get("success"):
-                logger.debug(f"api returned success=false | url={url} | keys={sorted(data.keys())}")
+                logger.debug(f"markitdown returned empty content | url={url} | keys={sorted(data.keys())}")
                 prev_count = int((failure_meta.get(url) or {}).get("count", 0) or 0)
                 count = prev_count + 1
                 failure_meta[url] = {
@@ -786,20 +901,24 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
                 f"content_preview={compact_excerpt(content, max_len=200)}"
             )
             try:
-                summary, usage = generate_summary_with_llm(
+                summary, usage, summary_mode = build_summary(
                     title=title,
                     content=content,
                     logger=logger,
-                    client=llm_client,
-                    limiter=llm_rate_limiter,
-                    model=args.llm_model,
-                    source_max_chars=args.summary_context_chars,
-                    max_tokens=args.summary_max_tokens,
+                    llm_client=llm_client,
+                    llm_rate_limiter=llm_rate_limiter,
+                    llm_model=args.llm_model,
+                    summary_cache=summary_cache,
                 )
-                llm_success_count += 1
-                llm_usage.prompt_tokens += usage.prompt_tokens
-                llm_usage.completion_tokens += usage.completion_tokens
-                llm_usage.total_tokens += usage.total_tokens
+                if summary_mode == "llm":
+                    llm_success_count += 1
+                    llm_usage.prompt_tokens += usage.prompt_tokens
+                    llm_usage.completion_tokens += usage.completion_tokens
+                    llm_usage.total_tokens += usage.total_tokens
+                elif summary_mode == "cache_hit":
+                    llm_cache_hit_count += 1
+                else:
+                    llm_fallback_count += 1
             except Exception as e:
                 logger.warning(f"llm summary failed | url={url} | err={e} | fallback=short_summary")
                 summary = short_summary(content)
@@ -832,31 +951,23 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
                 f"link extraction done | url={url} | extracted_count={len(extracted_links)} | "
                 f"sample={extracted_links[:10]}"
             )
-            if url in stop_expand_pages:
-                enqueue_skipped_by_filter += len(extracted_links)
-                logger.debug(
-                    f"expansion blocked by stop_expand_pages/all_blocked | source={url} | "
-                    f"blocked_count={len(extracted_links)}"
-                )
-            else:
-                source_block_set = block_links_by_source.get(url, set())
-                for link in extracted_links:
-                    if link in global_block_links or link in source_block_set:
-                        enqueue_skipped_by_filter += 1
-                        logger.debug(
-                            f"link filtered out | source={url} | target={link} | "
-                            f"reason={'global_block_links' if link in global_block_links else 'block_links_by_source'}"
-                        )
-                        continue
-                    if link in visited or link in queued:
-                        logger.debug(
-                            f"link skipped as duplicate | source={url} | target={link} | "
-                            f"visited={link in visited} | queued={link in queued}"
-                        )
-                        continue
-                    queue.append(link)
-                    queued.add(link)
-                    logger.debug(f"link enqueued | source={url} | target={link} | new_queue_size={len(queue)}")
+            for link in extracted_links:
+                denied_by = match_deny_pattern(link, deny_patterns)
+                if denied_by:
+                    enqueue_skipped_by_filter += 1
+                    logger.debug(
+                        f"link filtered out | source={url} | target={link} | reason=deny_pattern | pattern={denied_by}"
+                    )
+                    continue
+                if link in visited or link in queued:
+                    logger.debug(
+                        f"link skipped as duplicate | source={url} | target={link} | "
+                        f"visited={link in visited} | queued={link in queued}"
+                    )
+                    continue
+                queue.append(link)
+                queued.add(link)
+                logger.debug(f"link enqueued | source={url} | target={link} | new_queue_size={len(queue)}")
 
             logger.info(f"saved page | visited={len(visited)} | path={out_path.name} | url={url}")
 
@@ -871,6 +982,7 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
     state["failed"] = sorted(failed)
     state["failure_meta"] = failure_meta
     save_crawl_state(state_path, state)
+    save_summary_cache(summary_cache_path, summary_cache, logger)
     logger.debug(
         f"state saved | queue_size={len(queue)} | visited_size={len(visited)} | failed_size={len(failed)} | "
         f"state_file={state_path}"
@@ -885,7 +997,8 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
 
     logger.info(
         f"llm usage summary | model={args.llm_model} | llm_success={llm_success_count} "
-        f"| llm_fallback={llm_fallback_count} | enqueue_filtered={enqueue_skipped_by_filter} "
+        f"| llm_fallback={llm_fallback_count} | llm_cache_hit={llm_cache_hit_count} "
+        f"| enqueue_filtered={enqueue_skipped_by_filter} "
         f"| prompt_tokens={llm_usage.prompt_tokens} "
         f"| completion_tokens={llm_usage.completion_tokens} | total_tokens={llm_usage.total_tokens}"
     )
@@ -905,6 +1018,7 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
         failed_total=len(failed),
         llm_success_count=llm_success_count,
         llm_fallback_count=llm_fallback_count,
+        llm_cache_hit_count=llm_cache_hit_count,
         enqueue_skipped_by_filter=enqueue_skipped_by_filter,
         llm_usage=llm_usage,
     )
@@ -914,7 +1028,8 @@ def main() -> None:
     args = parse_args()
     logger = setup_logger(args.verbose)
     logger.debug(
-        f"runtime config | start_url={args.start_url} | per_run={args.per_run} | target_total={args.target_total} | "
+        f"runtime config | per_run={args.per_run} | target_total={args.target_total} | "
+        f"fetch_workers={args.fetch_workers} | "
         f"llm_model={args.llm_model} | llm_qps={args.llm_qps} | verbose={args.verbose} | "
         f"filter_json={args.explore_filter_json}"
     )
