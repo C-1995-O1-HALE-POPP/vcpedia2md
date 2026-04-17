@@ -23,6 +23,7 @@ from kb_batch_upload import UploadError, build_upload_summary, upload_files_to_k
 from loguru import logger  # pyright: ignore[reportMissingImports]
 from markitdown import MarkItDown  # pyright: ignore[reportMissingImports]
 from openai import OpenAI  # pyright: ignore[reportMissingImports]
+from tqdm import tqdm  # pyright: ignore[reportMissingImports]
 
 BASE = Path(__file__).resolve().parent
 PAGES_DIR = BASE / "research/vcpedia-pages-md"
@@ -71,23 +72,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--per-run",
         type=int,
-        default=20,
+        default=100,
         help="Max pages fetched per run",
     )
     p.add_argument(
         "--fetch-workers",
         type=int,
-        default=64,
+        default=8,
         help="Max parallel workers for page fetch in crawl mode",
+    )
+    p.add_argument(
+        "--wiki-qps",
+        type=float,
+        default=1.0,
+        help="Wiki fetch rate limit in requests per second (<=0 disables throttling)",
     )
     p.add_argument(
         "--target-total",
         type=int,
-        default=500,
+        default=0,
         help="Stop fetching when visited pages reach this total (<=0 means no cap)",
     )
     p.add_argument("--retry-base-seconds", type=float, default=30.0, help="Backoff base seconds for failed URLs")
     p.add_argument("--retry-max-seconds", type=float, default=3600.0, help="Backoff max seconds for failed URLs")
+    p.add_argument(
+        "--retry",
+        type=int,
+        default=0,
+        help="Retry up to N previously failed URLs first in current run (0 disables)",
+    )
     p.add_argument(
         "--llm-base-url",
         default=os.getenv("OPENAI_BASE_URL", "https://api.cursorai.art/v1"),
@@ -100,7 +113,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--llm-model",
-        default=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
+        default=os.getenv("OPENAI_MODEL", "gpt-5.4-mini"),
         help="Model name for OpenAI-compatible chat/completions",
     )
     p.add_argument(
@@ -194,11 +207,18 @@ def extract_title_from_markdown(markdown_text: str, fallback_url: str) -> str:
     return page_slug_from_url(fallback_url)
 
 
-def markitdown_convert_url(url: str, logger: Any, retries: int = 3) -> dict:
+def markitdown_convert_url(
+    url: str,
+    logger: Any,
+    wiki_rate_limiter: RequestRateLimiter | None = None,
+    retries: int = 3,
+) -> dict:
     last_err: Exception | None = None
     for i in range(1, retries + 1):
         try:
             logger.debug(f"markitdown convert start | attempt={i}/{retries} | url={url}")
+            if wiki_rate_limiter is not None:
+                wiki_rate_limiter.wait()
             converter = MarkItDown(enable_plugins=True)
             result = converter.convert(url)
             markdown_text = getattr(result, "text_content", "") or ""
@@ -744,6 +764,55 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
     failed = set(state["failed"])
     failure_meta: dict[str, dict[str, Any]] = dict(state.get("failure_meta", {}))
     deny_patterns = load_explore_filter_rules(Path(args.explore_filter_json), logger)
+    forced_retry_urls: set[str] = set()
+
+    retry_quota = max(0, int(args.retry))
+    if retry_quota > 0 and failed:
+        retry_candidates: list[str] = []
+        seen_retry: set[str] = set()
+
+        for url in state.get("failed", []):
+            if isinstance(url, str) and url.strip():
+                normalized = clean_url(url)
+                if normalized not in seen_retry and normalized in failed and normalized not in visited:
+                    retry_candidates.append(normalized)
+                    seen_retry.add(normalized)
+
+        for url in queue:
+            if url not in seen_retry and url in failed and url not in visited:
+                retry_candidates.append(url)
+                seen_retry.add(url)
+
+        valid_retry_candidates: list[str] = []
+        for url in retry_candidates:
+            denied_by = match_deny_pattern(url, deny_patterns)
+            if denied_by:
+                logger.debug(f"retry candidate denied by filter | url={url} | pattern={denied_by}")
+                continue
+            valid_retry_candidates.append(url)
+
+        valid_retry_candidates.sort(
+            key=lambda u: (
+                -int((failure_meta.get(u) or {}).get("count", 0) or 0),
+                str((failure_meta.get(u) or {}).get("next_retry_at") or ""),
+                u,
+            )
+        )
+
+        prioritized = valid_retry_candidates[:retry_quota]
+        if prioritized:
+            prioritized_set = set(prioritized)
+            queue = [url for url in queue if url not in prioritized_set]
+            queue = prioritized + queue
+            queued = set(queue)
+            forced_retry_urls = prioritized_set
+            logger.info(
+                f"retry prioritize enabled | retry={retry_quota} | prioritized={len(prioritized)} "
+                f"| sample={prioritized[:5]}"
+            )
+        else:
+            logger.info(f"retry prioritize enabled | retry={retry_quota} | prioritized=0")
+
     summary_cache_path = SUMMARY_CACHE_FILE
     summary_cache = load_summary_cache(summary_cache_path, logger)
 
@@ -757,6 +826,7 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
     else:
         logger.info("llm summary disabled: missing api key, will use local short_summary")
     llm_rate_limiter = RequestRateLimiter(args.llm_qps)
+    wiki_rate_limiter = RequestRateLimiter(args.wiki_qps)
 
     target_total = args.target_total if args.target_total > 0 else None
     if target_total is not None and len(visited) >= target_total:
@@ -764,6 +834,7 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
         return CrawlRunStats(queue_size=len(queue), visited_total=len(visited), failed_total=len(failed))
 
     per_run = max(1, args.per_run)
+    run_goal = per_run if target_total is None else min(per_run, max(0, target_total - len(visited)))
     retry_base = max(0.1, float(args.retry_base_seconds))
     retry_max = max(retry_base, float(args.retry_max_seconds))
     fetched_this_run = 0
@@ -787,195 +858,213 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
         f"failed_sample={sorted(list(failed))[:5]} | state_file={state_path}"
     )
 
-    while queue and fetched_this_run < per_run:
-        if target_total is not None and len(visited) >= target_total:
-            break
-
-        remaining_quota = per_run - fetched_this_run
-        if target_total is not None:
-            remaining_quota = min(remaining_quota, target_total - len(visited))
-        if remaining_quota <= 0:
-            break
-
-        # Step 1: pick URLs for this batch, skipping entries still in backoff.
-        batch_urls: list[str] = []
-        batch_selected: set[str] = set()
-        inspect_budget = len(queue)
-        logger.debug(
-            f"batch selection start | queue_size={len(queue)} | inspect_budget={inspect_budget} "
-            f"| fetched_this_run={fetched_this_run} | remaining_quota={remaining_quota}"
-        )
-        for _ in range(inspect_budget):
-            if len(batch_urls) >= remaining_quota:
+    progress_bar = tqdm(
+        total=run_goal,
+        desc="crawl overall",
+        unit="page",
+        dynamic_ncols=True,
+        disable=run_goal <= 0,
+    )
+    try:
+        while queue and fetched_this_run < per_run:
+            if target_total is not None and len(visited) >= target_total:
                 break
-            url = queue.pop(0)
-            queued.discard(url)
 
-            if url in batch_selected:
-                logger.debug(f"batch selection skip duplicate in same batch | url={url}")
-                continue
+            remaining_quota = per_run - fetched_this_run
+            if target_total is not None:
+                remaining_quota = min(remaining_quota, target_total - len(visited))
+            if remaining_quota <= 0:
+                break
 
-            if url in visited:
-                continue
-
-            denied_by = match_deny_pattern(url, deny_patterns)
-            if denied_by:
-                enqueue_skipped_by_filter += 1
-                logger.debug(f"url denied before fetch | url={url} | pattern={denied_by}")
-                continue
-
-            meta = failure_meta.get(url) or {}
-            next_retry_at = parse_iso_datetime(str(meta.get("next_retry_at") or ""))
-            if next_retry_at and datetime.now(timezone.utc) < next_retry_at:
-                queue.append(url)
-                queued.add(url)
-                deferred_retry_this_run += 1
-                logger.debug(
-                    f"batch selection deferred | url={url} | next_retry_at={next_retry_at.isoformat()}"
-                )
-                continue
-
-            batch_urls.append(url)
-            batch_selected.add(url)
-            logger.debug(f"batch selection picked | url={url}")
-
-        if not batch_urls:
-            logger.info("all pending URLs are in backoff window, stop this run")
-            break
-
-        scanned_this_run += len(batch_urls)
-        logger.debug(f"batch ready | batch_size={len(batch_urls)} | batch_urls={batch_urls}")
-        # Step 2: fetch page markdown in parallel (network-bound work).
-        fetch_results: dict[str, dict[str, Any] | None] = {}
-        fetch_errors: dict[str, str] = {}
-        max_workers = max(1, min(max(1, args.fetch_workers), len(batch_urls)))
-        logger.debug(f"batch fetch start | max_workers={max_workers} | batch_size={len(batch_urls)}")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_url = {
-                executor.submit(markitdown_convert_url, url, logger): url for url in batch_urls
-            }
-            for future in concurrent.futures.as_completed(future_to_url):
-                url = future_to_url[future]
-                try:
-                    fetch_results[url] = future.result()
-                    logger.debug(f"batch fetch ok | url={url}")
-                except Exception as e:
-                    fetch_results[url] = None
-                    fetch_errors[url] = str(e)
-                    logger.debug(f"batch fetch error | url={url} | err={e}")
-
-        # Step 3: apply crawl side effects sequentially to keep state/index writes predictable.
-        for url in batch_urls:
-            data = fetch_results.get(url)
-            if not data:
-                err = fetch_errors.get(url, "unknown_error")
-                logger.warning(f"fetch failed | url={url} | err={err}")
-                prev_count = int((failure_meta.get(url) or {}).get("count", 0) or 0)
-                count = prev_count + 1
-                failure_meta[url] = {
-                    "count": count,
-                    "next_retry_at": compute_next_retry_at(count, retry_base, retry_max),
-                    "last_error": err,
-                }
-                failed.add(url)
-                failed_this_run += 1
-                continue
-
-            if not data.get("success"):
-                logger.debug(f"markitdown returned empty content | url={url} | keys={sorted(data.keys())}")
-                prev_count = int((failure_meta.get(url) or {}).get("count", 0) or 0)
-                count = prev_count + 1
-                failure_meta[url] = {
-                    "count": count,
-                    "next_retry_at": compute_next_retry_at(count, retry_base, retry_max),
-                    "last_error": "api_success_false",
-                }
-                failed.add(url)
-                failed_this_run += 1
-                continue
-
-            title = (data.get("title") or "").strip() or page_slug_from_url(url)
-            content = data.get("content") or ""
+            # Step 1: pick URLs for this batch, skipping entries still in backoff.
+            batch_urls: list[str] = []
+            batch_selected: set[str] = set()
+            inspect_budget = len(queue)
             logger.debug(
-                f"page payload ready | url={url} | title={title} | content_chars={len(content)} | "
-                f"content_preview={compact_excerpt(content, max_len=200)}"
+                f"batch selection start | queue_size={len(queue)} | inspect_budget={inspect_budget} "
+                f"| fetched_this_run={fetched_this_run} | remaining_quota={remaining_quota}"
             )
-            try:
-                summary, usage, summary_mode = build_summary(
-                    title=title,
-                    content=content,
-                    logger=logger,
-                    llm_client=llm_client,
-                    llm_rate_limiter=llm_rate_limiter,
-                    llm_model=args.llm_model,
-                    summary_cache=summary_cache,
-                )
-                if summary_mode == "llm":
-                    llm_success_count += 1
-                    llm_usage.prompt_tokens += usage.prompt_tokens
-                    llm_usage.completion_tokens += usage.completion_tokens
-                    llm_usage.total_tokens += usage.total_tokens
-                elif summary_mode == "cache_hit":
-                    llm_cache_hit_count += 1
-                else:
-                    llm_fallback_count += 1
-            except Exception as e:
-                logger.warning(f"llm summary failed | url={url} | err={e} | fallback=short_summary")
-                summary = short_summary(content)
-                llm_fallback_count += 1
-                logger.debug(f"llm fallback summary | url={url} | summary={summary}")
-            out_path = write_page_markdown(pages_dir, title, url, summary, content)
-            fetched_at = iso_now()
-            logger.debug(
-                f"page persist start | url={url} | out_path={out_path} | fetched_at={fetched_at} | "
-                f"summary_chars={len(summary)}"
-            )
-            upsert_index_record(
-                index_file,
-                {
-                    "url": url,
-                    "title": title,
-                    "summary": summary,
-                    "file_path": str(out_path),
-                    "file_name": out_path.name,
-                    "fetched_at": fetched_at,
-                },
-            )
-            visited.add(url)
-            failed.discard(url)
-            failure_meta.pop(url, None)
-            fetched_this_run += 1
+            for _ in range(inspect_budget):
+                if len(batch_urls) >= remaining_quota:
+                    break
+                url = queue.pop(0)
+                queued.discard(url)
 
-            extracted_links = extract_internal_links(content)
-            logger.debug(
-                f"link extraction done | url={url} | extracted_count={len(extracted_links)} | "
-                f"sample={extracted_links[:10]}"
-            )
-            for link in extracted_links:
-                denied_by = match_deny_pattern(link, deny_patterns)
+                if url in batch_selected:
+                    logger.debug(f"batch selection skip duplicate in same batch | url={url}")
+                    continue
+
+                if url in visited:
+                    continue
+
+                denied_by = match_deny_pattern(url, deny_patterns)
                 if denied_by:
                     enqueue_skipped_by_filter += 1
+                    logger.debug(f"url denied before fetch | url={url} | pattern={denied_by}")
+                    continue
+
+                meta = failure_meta.get(url) or {}
+                next_retry_at = parse_iso_datetime(str(meta.get("next_retry_at") or ""))
+                if url in forced_retry_urls:
+                    forced_retry_urls.discard(url)
+                    logger.debug(f"batch selection retry override backoff | url={url}")
+                elif next_retry_at and datetime.now(timezone.utc) < next_retry_at:
+                    queue.append(url)
+                    queued.add(url)
+                    deferred_retry_this_run += 1
                     logger.debug(
-                        f"link filtered out | source={url} | target={link} | reason=deny_pattern | pattern={denied_by}"
+                        f"batch selection deferred | url={url} | next_retry_at={next_retry_at.isoformat()}"
                     )
                     continue
-                if link in visited or link in queued:
-                    logger.debug(
-                        f"link skipped as duplicate | source={url} | target={link} | "
-                        f"visited={link in visited} | queued={link in queued}"
-                    )
+
+                batch_urls.append(url)
+                batch_selected.add(url)
+                logger.debug(f"batch selection picked | url={url}")
+
+            if not batch_urls:
+                logger.info("all pending URLs are in backoff window, stop this run")
+                break
+
+            scanned_this_run += len(batch_urls)
+            if not progress_bar.disable:
+                remain = max(0, run_goal - int(progress_bar.n))
+                progress_bar.update(min(len(batch_urls), remain))
+                progress_bar.set_postfix(queue=len(queue), visited=len(visited), failed=len(failed), refresh=False)
+
+            logger.debug(f"batch ready | batch_size={len(batch_urls)} | batch_urls={batch_urls}")
+            # Step 2: fetch page markdown in parallel (network-bound work).
+            fetch_results: dict[str, dict[str, Any] | None] = {}
+            fetch_errors: dict[str, str] = {}
+            max_workers = max(1, min(max(1, args.fetch_workers), len(batch_urls)))
+            logger.debug(f"batch fetch start | max_workers={max_workers} | batch_size={len(batch_urls)}")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_url = {
+                    executor.submit(markitdown_convert_url, url, logger, wiki_rate_limiter): url for url in batch_urls
+                }
+                for future in concurrent.futures.as_completed(future_to_url):
+                    url = future_to_url[future]
+                    try:
+                        fetch_results[url] = future.result()
+                        logger.debug(f"batch fetch ok | url={url}")
+                    except Exception as e:
+                        fetch_results[url] = None
+                        fetch_errors[url] = str(e)
+                        logger.debug(f"batch fetch error | url={url} | err={e}")
+
+            # Step 3: apply crawl side effects sequentially to keep state/index writes predictable.
+            for url in batch_urls:
+                data = fetch_results.get(url)
+                if not data:
+                    err = fetch_errors.get(url, "unknown_error")
+                    logger.warning(f"fetch failed | url={url} | err={err}")
+                    prev_count = int((failure_meta.get(url) or {}).get("count", 0) or 0)
+                    count = prev_count + 1
+                    failure_meta[url] = {
+                        "count": count,
+                        "next_retry_at": compute_next_retry_at(count, retry_base, retry_max),
+                        "last_error": err,
+                    }
+                    failed.add(url)
+                    failed_this_run += 1
                     continue
-                queue.append(link)
-                queued.add(link)
-                logger.debug(f"link enqueued | source={url} | target={link} | new_queue_size={len(queue)}")
 
-            logger.info(f"saved page | visited={len(visited)} | path={out_path.name} | url={url}")
+                if not data.get("success"):
+                    logger.debug(f"markitdown returned empty content | url={url} | keys={sorted(data.keys())}")
+                    prev_count = int((failure_meta.get(url) or {}).get("count", 0) or 0)
+                    count = prev_count + 1
+                    failure_meta[url] = {
+                        "count": count,
+                        "next_retry_at": compute_next_retry_at(count, retry_base, retry_max),
+                        "last_error": "api_success_false",
+                    }
+                    failed.add(url)
+                    failed_this_run += 1
+                    continue
 
-        if scanned_this_run % args.log_every == 0:
-            logger.info(
-                f"progress | scanned_this_run={scanned_this_run} | fetched_this_run={fetched_this_run} "
-                f"| queue={len(queue)} | visited={len(visited)} | failed={len(failed)}"
-            )
+                title = (data.get("title") or "").strip() or page_slug_from_url(url)
+                content = data.get("content") or ""
+                logger.debug(
+                    f"page payload ready | url={url} | title={title} | content_chars={len(content)} | "
+                    f"content_preview={compact_excerpt(content, max_len=200)}"
+                )
+                try:
+                    summary, usage, summary_mode = build_summary(
+                        title=title,
+                        content=content,
+                        logger=logger,
+                        llm_client=llm_client,
+                        llm_rate_limiter=llm_rate_limiter,
+                        llm_model=args.llm_model,
+                        summary_cache=summary_cache,
+                    )
+                    if summary_mode == "llm":
+                        llm_success_count += 1
+                        llm_usage.prompt_tokens += usage.prompt_tokens
+                        llm_usage.completion_tokens += usage.completion_tokens
+                        llm_usage.total_tokens += usage.total_tokens
+                    elif summary_mode == "cache_hit":
+                        llm_cache_hit_count += 1
+                    else:
+                        llm_fallback_count += 1
+                except Exception as e:
+                    logger.warning(f"llm summary failed | url={url} | err={e} | fallback=short_summary")
+                    summary = short_summary(content)
+                    llm_fallback_count += 1
+                    logger.debug(f"llm fallback summary | url={url} | summary={summary}")
+                out_path = write_page_markdown(pages_dir, title, url, summary, content)
+                fetched_at = iso_now()
+                logger.debug(
+                    f"page persist start | url={url} | out_path={out_path} | fetched_at={fetched_at} | "
+                    f"summary_chars={len(summary)}"
+                )
+                upsert_index_record(
+                    index_file,
+                    {
+                        "url": url,
+                        "title": title,
+                        "summary": summary,
+                        "file_path": str(out_path),
+                        "file_name": out_path.name,
+                        "fetched_at": fetched_at,
+                    },
+                )
+                visited.add(url)
+                failed.discard(url)
+                failure_meta.pop(url, None)
+                fetched_this_run += 1
+
+                extracted_links = extract_internal_links(content)
+                logger.debug(
+                    f"link extraction done | url={url} | extracted_count={len(extracted_links)} | "
+                    f"sample={extracted_links[:10]}"
+                )
+                for link in extracted_links:
+                    denied_by = match_deny_pattern(link, deny_patterns)
+                    if denied_by:
+                        enqueue_skipped_by_filter += 1
+                        logger.debug(
+                            f"link filtered out | source={url} | target={link} | reason=deny_pattern | pattern={denied_by}"
+                        )
+                        continue
+                    if link in visited or link in queued:
+                        logger.debug(
+                            f"link skipped as duplicate | source={url} | target={link} | "
+                            f"visited={link in visited} | queued={link in queued}"
+                        )
+                        continue
+                    queue.append(link)
+                    queued.add(link)
+                    logger.debug(f"link enqueued | source={url} | target={link} | new_queue_size={len(queue)}")
+
+                logger.info(f"saved page | visited={len(visited)} | path={out_path.name} | url={url}")
+
+            if scanned_this_run % args.log_every == 0:
+                logger.info(
+                    f"progress | scanned_this_run={scanned_this_run} | fetched_this_run={fetched_this_run} "
+                    f"| queue={len(queue)} | visited={len(visited)} | failed={len(failed)}"
+                )
+    finally:
+        progress_bar.close()
 
     state["queue"] = queue
     state["visited"] = sorted(visited)
@@ -1029,7 +1118,7 @@ def main() -> None:
     logger = setup_logger(args.verbose)
     logger.debug(
         f"runtime config | per_run={args.per_run} | target_total={args.target_total} | "
-        f"fetch_workers={args.fetch_workers} | "
+        f"fetch_workers={args.fetch_workers} | wiki_qps={args.wiki_qps} | "
         f"llm_model={args.llm_model} | llm_qps={args.llm_qps} | verbose={args.verbose} | "
         f"filter_json={args.explore_filter_json}"
     )
