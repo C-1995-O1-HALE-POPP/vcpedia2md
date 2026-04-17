@@ -84,7 +84,6 @@ LLM 接口：
 - `--llm-qps`
 - `--fetch-timeout`
 - `--fetch-batch-size`
-- `--ignore-env-proxy`
 
 ## 4. Explore Filter
 
@@ -221,6 +220,6 @@ python main.py \
 
 先加 `--verbose` 看详细日志。当前版本会把 `--per-run` 作为“本轮最多尝试多少个 URL”，并默认启用 `--fetch-timeout 30` 与较小批次抓取，避免单个 URL 长时间阻塞整批任务。
 
-6. 代理环境会影响抓取吗？
+6. 抓取现在还会读取系统代理吗？
 
-会。`requests` 默认会读取 `HTTP(S)_PROXY` / `ALL_PROXY`。如果机器上的代理地址失效，可以加 `--ignore-env-proxy` 绕过环境代理后再跑。
+不会。当前版本的抓取请求固定走直连，不再读取环境代理，也不再提供代理相关开关。
