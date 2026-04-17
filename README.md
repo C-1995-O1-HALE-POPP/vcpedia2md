@@ -82,6 +82,9 @@ LLM 接口：
 - `--llm-model`
 - `--llm-timeout`
 - `--llm-qps`
+- `--fetch-timeout`
+- `--fetch-batch-size`
+- `--ignore-env-proxy`
 
 ## 4. Explore Filter
 
@@ -161,6 +164,7 @@ PY
 python main.py \
   --per-run 20 \
   --llm-qps 1.0 \
+  --fetch-timeout 30 \
   --explore-filter-json "research/vcpedia-explore-filter.json" \
   --notify-on-failure
 ```
@@ -175,6 +179,7 @@ export ASTRBOT_TOKEN="你的JWT token"
 python main.py \
   --per-run 20 \
   --llm-qps 1.0 \
+  --fetch-timeout 30 \
   --explore-filter-json "research/vcpedia-explore-filter.json" \
   --kb-id "$ASTRBOT_KB_ID" \
   --kb-base-url "$ASTRBOT_BASE_URL" \
@@ -211,3 +216,11 @@ python main.py \
 4. 现在怎么设置起始页面？
 
 直接手动编辑 [research/vcpedia-crawl-state.json](research/vcpedia-crawl-state.json) 里的 `queue`。程序不再读取 `--start-url`，也不会自动补 seed。
+
+5. 为什么看起来卡在 `0/3000`？
+
+先加 `--verbose` 看详细日志。当前版本会把 `--per-run` 作为“本轮最多尝试多少个 URL”，并默认启用 `--fetch-timeout 30` 与较小批次抓取，避免单个 URL 长时间阻塞整批任务。
+
+6. 代理环境会影响抓取吗？
+
+会。`requests` 默认会读取 `HTTP(S)_PROXY` / `ALL_PROXY`。如果机器上的代理地址失效，可以加 `--ignore-env-proxy` 绕过环境代理后再跑。

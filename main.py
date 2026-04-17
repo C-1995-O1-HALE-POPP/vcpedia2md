@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import requests
 from kb_batch_upload import UploadError, build_upload_summary, upload_files_to_kb
 from loguru import logger  # pyright: ignore[reportMissingImports]
 from markitdown import MarkItDown  # pyright: ignore[reportMissingImports]
@@ -73,13 +74,30 @@ def parse_args() -> argparse.Namespace:
         "--per-run",
         type=int,
         default=100,
-        help="Max pages fetched per run",
+        help="Max pages attempted per run",
     )
     p.add_argument(
         "--fetch-workers",
         type=int,
         default=8,
         help="Max parallel workers for page fetch in crawl mode",
+    )
+    p.add_argument(
+        "--fetch-batch-size",
+        type=int,
+        default=0,
+        help="Max URLs submitted in one fetch batch (<=0 means auto: fetch_workers * 2)",
+    )
+    p.add_argument(
+        "--fetch-timeout",
+        type=float,
+        default=30.0,
+        help="Per-request timeout in seconds for MarkItDown URL fetch (<=0 disables timeout)",
+    )
+    p.add_argument(
+        "--ignore-env-proxy",
+        action="store_true",
+        help="Ignore HTTP(S)_PROXY / ALL_PROXY environment variables for wiki fetches",
     )
     p.add_argument(
         "--wiki-qps",
@@ -212,14 +230,24 @@ def markitdown_convert_url(
     logger: Any,
     wiki_rate_limiter: RequestRateLimiter | None = None,
     retries: int = 3,
+    fetch_timeout: float = 30.0,
+    ignore_env_proxy: bool = False,
 ) -> dict:
     last_err: Exception | None = None
     for i in range(1, retries + 1):
+        requests_session: DefaultTimeoutSession | None = None
         try:
-            logger.debug(f"markitdown convert start | attempt={i}/{retries} | url={url}")
+            logger.debug(
+                f"markitdown convert start | attempt={i}/{retries} | url={url} "
+                f"| fetch_timeout={fetch_timeout} | ignore_env_proxy={ignore_env_proxy}"
+            )
             if wiki_rate_limiter is not None:
                 wiki_rate_limiter.wait()
-            converter = MarkItDown(enable_plugins=True)
+            requests_session = DefaultTimeoutSession(
+                default_timeout=fetch_timeout if fetch_timeout > 0 else None,
+                trust_env=not ignore_env_proxy,
+            )
+            converter = MarkItDown(enable_plugins=True, requests_session=requests_session)
             result = converter.convert(url)
             markdown_text = getattr(result, "text_content", "") or ""
             title = (
@@ -241,6 +269,9 @@ def markitdown_convert_url(
             last_err = e
             logger.debug(f"markitdown convert failed | attempt={i}/{retries} | url={url} | err={e}")
             time.sleep(0.5 * i)
+        finally:
+            if requests_session is not None:
+                requests_session.close()
     if last_err:
         raise last_err
     raise RuntimeError("unreachable")
@@ -321,6 +352,21 @@ class RequestRateLimiter:
                 time.sleep(wait_seconds)
                 now = time.monotonic()
             self._next_allowed_ts = max(self._next_allowed_ts + interval, now + interval)
+
+
+class DefaultTimeoutSession(requests.Session):
+    """requests.Session with an optional default timeout and controllable env-proxy usage."""
+
+    def __init__(self, *, default_timeout: float | None, trust_env: bool) -> None:
+        super().__init__()
+        self._default_timeout = default_timeout
+        self.trust_env = trust_env
+        self.headers.update({"Accept": "text/markdown, text/html;q=0.9, text/plain;q=0.8, */*;q=0.1"})
+
+    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        if self._default_timeout is not None and "timeout" not in kwargs:
+            kwargs["timeout"] = self._default_timeout
+        return super().request(method, url, **kwargs)
 
 
 @dataclass
@@ -835,6 +881,11 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
 
     per_run = max(1, args.per_run)
     run_goal = per_run if target_total is None else min(per_run, max(0, target_total - len(visited)))
+    fetch_batch_size = (
+        max(1, int(args.fetch_batch_size))
+        if int(args.fetch_batch_size) > 0
+        else max(1, int(args.fetch_workers) * 2)
+    )
     retry_base = max(0.1, float(args.retry_base_seconds))
     retry_max = max(retry_base, float(args.retry_max_seconds))
     fetched_this_run = 0
@@ -851,6 +902,10 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
         f"crawl start | queue={len(queue)} | visited={len(visited)} | failed={len(failed)} "
         f"| per_run={per_run} | target_total={target_total if target_total is not None else 'none'}"
     )
+    logger.debug(
+        f"fetch config | workers={args.fetch_workers} | batch_size={fetch_batch_size} "
+        f"| timeout={args.fetch_timeout} | ignore_env_proxy={args.ignore_env_proxy}"
+    )
     if not queue:
         logger.warning(f"没有待抓取 URL，请手动编辑 {state_path} 的 state.queue")
     logger.debug(
@@ -866,11 +921,11 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
         disable=run_goal <= 0,
     )
     try:
-        while queue and fetched_this_run < per_run:
+        while queue and scanned_this_run < run_goal:
             if target_total is not None and len(visited) >= target_total:
                 break
 
-            remaining_quota = per_run - fetched_this_run
+            remaining_quota = run_goal - scanned_this_run
             if target_total is not None:
                 remaining_quota = min(remaining_quota, target_total - len(visited))
             if remaining_quota <= 0:
@@ -879,13 +934,15 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
             # Step 1: pick URLs for this batch, skipping entries still in backoff.
             batch_urls: list[str] = []
             batch_selected: set[str] = set()
+            batch_target_size = min(remaining_quota, fetch_batch_size)
             inspect_budget = len(queue)
             logger.debug(
                 f"batch selection start | queue_size={len(queue)} | inspect_budget={inspect_budget} "
-                f"| fetched_this_run={fetched_this_run} | remaining_quota={remaining_quota}"
+                f"| scanned_this_run={scanned_this_run} | remaining_quota={remaining_quota} "
+                f"| batch_target_size={batch_target_size}"
             )
             for _ in range(inspect_budget):
-                if len(batch_urls) >= remaining_quota:
+                if len(batch_urls) >= batch_target_size:
                     break
                 url = queue.pop(0)
                 queued.discard(url)
@@ -929,7 +986,7 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
             if not progress_bar.disable:
                 remain = max(0, run_goal - int(progress_bar.n))
                 progress_bar.update(min(len(batch_urls), remain))
-                progress_bar.set_postfix(queue=len(queue), visited=len(visited), failed=len(failed), refresh=False)
+                progress_bar.set_postfix(queue=len(queue), visited=len(visited), failed=len(failed), refresh=True)
 
             logger.debug(f"batch ready | batch_size={len(batch_urls)} | batch_urls={batch_urls}")
             # Step 2: fetch page markdown in parallel (network-bound work).
@@ -939,7 +996,16 @@ def run_incremental_crawl_mode(args: argparse.Namespace, logger: Any) -> CrawlRu
             logger.debug(f"batch fetch start | max_workers={max_workers} | batch_size={len(batch_urls)}")
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_url = {
-                    executor.submit(markitdown_convert_url, url, logger, wiki_rate_limiter): url for url in batch_urls
+                    executor.submit(
+                        markitdown_convert_url,
+                        url,
+                        logger,
+                        wiki_rate_limiter,
+                        3,
+                        float(args.fetch_timeout),
+                        bool(args.ignore_env_proxy),
+                    ): url
+                    for url in batch_urls
                 }
                 for future in concurrent.futures.as_completed(future_to_url):
                     url = future_to_url[future]
